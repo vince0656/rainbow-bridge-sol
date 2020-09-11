@@ -291,7 +291,7 @@ interface INearBridge {
 
     function initWithValidators(bytes calldata initialValidators) external;
     function initWithBlock(bytes calldata data) external;
-    function addLightClientBlock(bytes calldata data) external payable;
+    function addLightClientBlock(bytes calldata data) external;
     function challenge(address payable receiver, uint256 signatureIndex) external;
     function checkBlockProducerSignatureInHead(uint256 signatureIndex) external view returns(bool);
 }
@@ -1840,11 +1840,11 @@ contract NearBridge is INearBridge {
     // Minimal information about the submitted block.
     struct BlockInfo {
         uint64 height;
+        uint256 timestamp;
         bytes32 epochId;
         bytes32 nextEpochId;
-        address submitter;
-        uint256 validAfter;
         bytes32 hash;
+        bytes32 merkleRoot;
         bytes32 next_hash;
         uint256 approvals_after_next_length;
         mapping(uint256 => NearDecoder.OptionalSignature) approvals_after_next;
@@ -1856,25 +1856,31 @@ contract NearBridge is INearBridge {
     address payable burner;
     uint256 public lockEthAmount;
     uint256 public lockDuration;
+    uint256 public replaceDuration;
     Ed25519 edwards;
 
     // Block producers of the current epoch.
     BlockProducerInfo public currentBlockProducers;
     // Block producers of the next epoch.
     BlockProducerInfo public nextBlockProducers;
-    // Backup current block producers. When candidate block is submitted and it comes from the next epoch, we backup
-    // current block producers. Then if it gets successfully challenged, we recover it the following way:
-    // nextBlockProducers <- currentBlockProducers
-    // currentBlockProducers <- backupCurrentBlockProducers
-    BlockProducerInfo public backupCurrentBlockProducers;
 
-    // The most recent block.
+    // The most recent head that is guaranteed to be valid.
     BlockInfo public head;
-    // The backup of the previous most recent block, in case it was challenged.
-    BlockInfo public backupHead;
 
-    mapping(uint64 => bytes32) public blockHashes;
-    mapping(uint64 => bytes32) public blockMerkleRoots;
+    // The most recently added block. May still be in its challenge period, so should not be trusted.
+    BlockInfo untrustedHead;
+    // True if untrustedHead is from the following epoch of currentHead.
+    // False if it is from the same epoch.
+    bool untrustedHeadIsFromNextEpoch;
+    // Next block producers from untrustedHead, if any.
+    BlockProducerInfo untrustedNextBlockProducers;
+    // Address of the account which submitted the last block.
+    address lastSubmitter;
+    // End of challenge period, or zero if there is no block to be challenged.
+    uint lastValidAt;
+
+    mapping(uint64 => bytes32) blockHashes_;
+    mapping(uint64 => bytes32) blockMerkleRoots_;
     mapping(address => uint256) public balanceOf;
 
     event BlockHashAdded(
@@ -1887,10 +1893,11 @@ contract NearBridge is INearBridge {
         bytes32 blockHash
     );
 
-    constructor(Ed25519 ed, uint256 _lockEthAmount, uint256 _lockDuration) public {
+    constructor(Ed25519 ed, uint256 _lockEthAmount, uint256 _lockDuration, uint256 _replaceDuration) public {
         edwards = ed;
         lockEthAmount = _lockEthAmount;
         lockDuration = _lockDuration;
+        replaceDuration = _replaceDuration;
         burner = address(0);
     }
 
@@ -1900,13 +1907,13 @@ contract NearBridge is INearBridge {
     }
 
     function withdraw() public {
-        require(msg.sender != head.submitter || block.timestamp > head.validAfter);
+        require(msg.sender != lastSubmitter || block.timestamp >= lastValidAt);
         balanceOf[msg.sender] = balanceOf[msg.sender].sub(lockEthAmount);
         msg.sender.transfer(lockEthAmount);
     }
 
     function challenge(address payable receiver, uint256 signatureIndex) public {
-        require(block.timestamp < head.validAfter, "Lock period already passed");
+        require(block.timestamp < lastValidAt, "No block can be challenged at this time");
 
         require(
             !checkBlockProducerSignatureInHead(signatureIndex),
@@ -1917,51 +1924,32 @@ contract NearBridge is INearBridge {
     }
 
     function checkBlockProducerSignatureInHead(uint256 signatureIndex) public view returns(bool) {
-        if (head.approvals_after_next[signatureIndex].none) {
+        if (untrustedHead.approvals_after_next[signatureIndex].none) {
             return true;
         }
+        BlockProducerInfo storage untrustedBlockProducers
+            = untrustedHeadIsFromNextEpoch
+            ? nextBlockProducers : currentBlockProducers;
         return _checkValidatorSignature(
-            head.height,
-            head.next_hash,
-            head.approvals_after_next[signatureIndex].signature,
-            currentBlockProducers.bps[signatureIndex].publicKey
+            untrustedHead.height,
+            untrustedHead.next_hash,
+            untrustedHead.approvals_after_next[signatureIndex].signature,
+            untrustedBlockProducers.bps[signatureIndex].publicKey
         );
     }
 
     function _payRewardAndRollBack(address payable receiver) internal {
         // Pay reward
-        balanceOf[head.submitter] = balanceOf[head.submitter].sub(lockEthAmount);
+        balanceOf[lastSubmitter] = balanceOf[lastSubmitter].sub(lockEthAmount);
         receiver.transfer(lockEthAmount / 2);
         burner.transfer(lockEthAmount - lockEthAmount / 2);
 
         emit BlockHashReverted(
-            head.height,
-            blockHashes[head.height]
+            untrustedHead.height,
+            untrustedHead.hash
         );
 
-        // Restore last state from backup
-        delete blockHashes[head.height];
-        delete blockMerkleRoots[head.height];
-
-        if (head.epochId != backupHead.epochId) {
-            // When epoch id is different we need to modify the backed up block producers.
-            // nextBlockProducers <- currentBlockProducers
-            nextBlockProducers = currentBlockProducers;
-            for (uint i = 0; i < nextBlockProducers.bpsLength; i++) {
-                nextBlockProducers.bps[i] = currentBlockProducers.bps[i];
-            }
-            // currentBlockProducers <- backupCurrentBlockProducers
-            currentBlockProducers = backupCurrentBlockProducers;
-            for (uint i = 0; i < currentBlockProducers.bpsLength; i++) {
-                currentBlockProducers.bps[i] = backupCurrentBlockProducers.bps[i];
-            }
-        }
-
-        // Finally we restore the head.
-        head = backupHead;
-        for (uint i = 0; i < head.approvals_after_next_length; i++) {
-            head.approvals_after_next[i] = backupHead.approvals_after_next[i];
-        }
+        lastValidAt = 0;
     }
 
     // The first part of initialization -- setting the validators of the current epoch.
@@ -1994,7 +1982,11 @@ contract NearBridge is INearBridge {
         Borsh.Data memory borsh = Borsh.from(data);
         NearDecoder.LightClientBlock memory nearBlock = borsh.decodeLightClientBlock();
         require(borsh.finished(), "NearBridge: only light client block should be passed as first argument");
-        _setHead(nearBlock, data, true);
+
+        require(!nearBlock.next_bps.none, "NearBridge: The first block of the epoch should contain next_bps.");
+        setBlockInfo(nearBlock, head, nextBlockProducers);
+        blockHashes_[head.height] = head.hash;
+        blockMerkleRoots_[head.height] = head.merkleRoot;
     }
 
     function _checkBp(NearDecoder.LightClientBlock memory nearBlock, BlockProducerInfo storage bpInfo) internal {
@@ -2012,14 +2004,21 @@ contract NearBridge is INearBridge {
         require(votedFor > bpInfo.totalStake.mul(2).div(3), "NearBridge: Less than 2/3 voted by the block after next");
     }
 
-    function addLightClientBlock(bytes memory data) public payable {
+    function addLightClientBlock(bytes memory data) public {
         require(initialized, "NearBridge: Contract is not initialized.");
         require(balanceOf[msg.sender] >= lockEthAmount, "Balance is not enough");
-        require(block.timestamp >= head.validAfter, "Wait until last block become valid");
 
         Borsh.Data memory borsh = Borsh.from(data);
         NearDecoder.LightClientBlock memory nearBlock = borsh.decodeLightClientBlock();
         require(borsh.finished(), "NearBridge: only light client block should be passed");
+
+        if (block.timestamp >= lastValidAt) {
+            if (lastValidAt != 0) {
+                commitBlock();
+            }
+        } else {
+            require(nearBlock.inner_lite.timestamp >= untrustedHead.timestamp.add(replaceDuration), "NearBridge: can only replace with a sufficiently newer block");
+        }
 
         // 1. The height of the block is higher than the height of the current head
         require(
@@ -2059,70 +2058,73 @@ contract NearBridge is INearBridge {
             );
         }
 
-        _setHead(nearBlock, data, false);
+        setBlockInfo(nearBlock, untrustedHead, untrustedNextBlockProducers);
+        untrustedHeadIsFromNextEpoch = nearBlock.inner_lite.epoch_id == head.nextEpochId;
+        lastSubmitter = msg.sender;
+        lastValidAt = block.timestamp.add(lockDuration);
     }
 
-    function _setHead(NearDecoder.LightClientBlock memory nearBlock, bytes memory data, bool init) internal {
-        // If block is from the next epoch or it is initialization then update block producers.
-        if (init || nearBlock.inner_lite.epoch_id == head.nextEpochId) {
-            // If block from the next epoch then it should contain next_bps.
-            require(!nearBlock.next_bps.none, "NearBridge: The first block of the epoch should contain next_bps.");
-            // If this is initialization then no need for the backup.
-            if (!init) {
-                // backupCurrentBlockProducers <- currentBlockProducers
-                backupCurrentBlockProducers = currentBlockProducers;
-                for (uint i = 0; i < backupCurrentBlockProducers.bpsLength; i++) {
-                    backupCurrentBlockProducers.bps[i] = currentBlockProducers.bps[i];
-                }
-                // currentBlockProducers <- nextBlockProducers
-                currentBlockProducers = nextBlockProducers;
-                for (uint i = 0; i < currentBlockProducers.bpsLength; i++) {
-                    currentBlockProducers.bps[i] = nextBlockProducers.bps[i];
-                }
-            }
-            // nextBlockProducers <- new block producers
-            nextBlockProducers.bpsLength = nearBlock.next_bps.validatorStakes.length;
+    function setBlockInfo(
+        NearDecoder.LightClientBlock memory src,
+        BlockInfo storage destBlock,
+        BlockProducerInfo storage destBPs
+    )
+        internal
+    {
+        destBlock.height = src.inner_lite.height;
+        destBlock.timestamp = src.inner_lite.timestamp;
+        destBlock.epochId = src.inner_lite.epoch_id;
+        destBlock.nextEpochId = src.inner_lite.next_epoch_id;
+        destBlock.hash = src.hash;
+        destBlock.merkleRoot = src.inner_lite.block_merkle_root;
+        destBlock.next_hash = src.next_hash;
+        destBlock.approvals_after_next_length = src.approvals_after_next.length;
+        for (uint i = 0; i < src.approvals_after_next.length; i++) {
+            destBlock.approvals_after_next[i] = src.approvals_after_next[i];
+        }
+
+        if (src.next_bps.none) {
+            destBPs.bpsLength = 0;
+            destBPs.totalStake = 0;
+        } else {
+            destBPs.bpsLength = src.next_bps.validatorStakes.length;
             uint256 totalStake = 0;
-            for (uint i = 0; i < nextBlockProducers.bpsLength; i++) {
-                nextBlockProducers.bps[i] = BlockProducer({
-                    publicKey: nearBlock.next_bps.validatorStakes[i].public_key,
-                    stake: nearBlock.next_bps.validatorStakes[i].stake
-                    });
-                totalStake = totalStake.add(nearBlock.next_bps.validatorStakes[i].stake);
+            for (uint i = 0; i < src.next_bps.validatorStakes.length; i++) {
+                destBPs.bps[i] = BlockProducer({
+                    publicKey: src.next_bps.validatorStakes[i].public_key,
+                    stake: src.next_bps.validatorStakes[i].stake
+                });
+                totalStake = totalStake.add(src.next_bps.validatorStakes[i].stake);
             }
-            nextBlockProducers.totalStake = totalStake;
+            destBPs.totalStake = totalStake;
         }
-
-        if (!init) {
-            // Backup the head. No need to backup if it is initialization.
-            backupHead = head;
-            for (uint i = 0; i < head.approvals_after_next_length; i++) {
-                backupHead.approvals_after_next[i] = head.approvals_after_next[i];
-            }
-        }
-
-        // Update the head.
-        head = BlockInfo({
-            height: nearBlock.inner_lite.height,
-            epochId: nearBlock.inner_lite.epoch_id,
-            nextEpochId: nearBlock.inner_lite.next_epoch_id,
-            submitter: msg.sender,
-            validAfter: init ? 0 : block.timestamp.add(lockDuration),
-            hash: keccak256(data),
-            next_hash: nearBlock.next_hash,
-            approvals_after_next_length: nearBlock.approvals_after_next.length
-        });
-        for (uint i = 0; i < nearBlock.approvals_after_next.length; i++) {
-            head.approvals_after_next[i] = nearBlock.approvals_after_next[i];
-        }
-
-        blockHashes[nearBlock.inner_lite.height] = nearBlock.hash;
-        blockMerkleRoots[nearBlock.inner_lite.height] = nearBlock.inner_lite.block_merkle_root;
 
         emit BlockHashAdded(
-            nearBlock.inner_lite.height,
-            blockHashes[nearBlock.inner_lite.height]
+            src.inner_lite.height,
+            src.hash
         );
+    }
+
+    function commitBlock() internal {
+        require(lastValidAt != 0 && block.timestamp >= lastValidAt, "Nothing to commit");
+
+        head = untrustedHead;
+        if (untrustedHeadIsFromNextEpoch) {
+            copyBlockProducers(nextBlockProducers, currentBlockProducers);
+            copyBlockProducers(untrustedNextBlockProducers, nextBlockProducers);
+        }
+        lastValidAt = 0;
+
+        blockHashes_[head.height] = head.hash;
+        blockMerkleRoots_[head.height] = head.merkleRoot;
+    }
+
+    function copyBlockProducers(BlockProducerInfo storage src, BlockProducerInfo storage dest) internal {
+        dest.bpsLength = src.bpsLength;
+        dest.totalStake = src.totalStake;
+        for (uint i = 0; i < src.bpsLength; i++) {
+            dest.bps[i] = src.bps[i];
+        }
     }
 
     function _checkValidatorSignature(
@@ -2164,5 +2166,19 @@ contract NearBridge is INearBridge {
             ((r & 0xFFFF0000FFFF0000) >> 16);
         r = ((r & 0x00FF00FF00FF00FF) << 8) |
             ((r & 0xFF00FF00FF00FF00) >> 8);
+    }
+
+    function blockHashes(uint64 height) public view returns (bytes32 res) {
+        res = blockHashes_[height];
+        if (res == 0 && block.timestamp >= lastValidAt && lastValidAt != 0 && height == untrustedHead.height) {
+            res = untrustedHead.hash;
+        }
+    }
+
+    function blockMerkleRoots(uint64 height) public view returns (bytes32 res) {
+        res = blockMerkleRoots_[height];
+        if (res == 0 && block.timestamp >= lastValidAt && lastValidAt != 0 && height == untrustedHead.height) {
+            res = untrustedHead.merkleRoot;
+        }
     }
 }

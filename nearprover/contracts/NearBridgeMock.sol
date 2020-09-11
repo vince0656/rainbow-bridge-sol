@@ -31,7 +31,7 @@ contract NearBridgeMock is INearBridge {
     function initWithBlock(bytes calldata data) external {
     }
 
-    function addLightClientBlock(bytes calldata data) external payable {
+    function addLightClientBlock(bytes calldata data) external {
     }
 
     function challenge(address payable receiver, uint256 signatureIndex) external {
