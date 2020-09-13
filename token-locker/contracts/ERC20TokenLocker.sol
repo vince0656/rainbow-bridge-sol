@@ -7,7 +7,7 @@ import "../../nearbridge/contracts/NearDecoder.sol";
 import "../../nearbridge/contracts/Borsh.sol";
 
 
-contract TokenLocker {
+contract ERC20TokenLocker {
     using SafeERC20 for IERC20;
     using Borsh for Borsh.Data;
     using ProofDecoder for Borsh.Data;
