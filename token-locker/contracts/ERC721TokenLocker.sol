@@ -35,7 +35,7 @@ contract ERC721TokenLocker {
 
     // Function output from burning fungible token on Near side.
     struct BurnResult {
-        uint128 amount; // leaving the name of the event field [amount] unchanged FOR NOW. It will be used as the tokenId
+        uint128 tokenId; // this could limit which projects are able to use this contract if their token Id requires a bigger int
         address recipient;
     }
 
@@ -72,15 +72,14 @@ contract ERC721TokenLocker {
         require(!status.unknown, "Cannot use unknown execution outcome for unlocking the tokens.");
         
         BurnResult memory result = _decodeBurnResult(status.successValue);
-        uint128 tokenId = result.amount;
-        ethToken.safeTransferFrom(address(this), result.recipient, tokenId);
+        ethToken.safeTransferFrom(address(this), result.recipient, result.tokenId);
         
-        emit Unlocked(tokenId, result.recipient);
+        emit Unlocked(result.tokenId, result.recipient);
     }
 
     function _decodeBurnResult(bytes memory data) internal pure returns(BurnResult memory result) {
         Borsh.Data memory borshData = Borsh.from(data);
-        result.amount = borshData.decodeU128();
+        result.tokenId = borshData.decodeU128();
         bytes20 recipient = borshData.decodeBytes20();
         result.recipient = address(uint160(recipient));
     }
