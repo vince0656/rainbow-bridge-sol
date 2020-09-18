@@ -9,7 +9,7 @@ import "../../nearbridge/contracts/Borsh.sol";
 // ERC721Locker is linked to a non-fungible token on Ethereum side and mintable non-fungible
 // token on NEAR side, it also links to the prover that it uses to unlock the tokens.
 contract ERC721TokenLocker {
-    
+
     using Borsh for Borsh.Data;
     using ProofDecoder for Borsh.Data;
     using NearDecoder for Borsh.Data;
@@ -45,14 +45,13 @@ contract ERC721TokenLocker {
         prover = _prover;
     }
 
-    function lockToken(uint256 amount, string memory accountId) public {
-        uint256 tokenId = amount;
-        ethToken.safeTransferFrom(msg.sender, address(this), tokenId);
+    function lockToken(uint256 tokenId, string calldata accountId) external {
+        ethToken.transferFrom(msg.sender, address(this), tokenId);
 
         emit Locked(address(ethToken), msg.sender, tokenId, accountId);
     }
 
-    function unlockToken(bytes memory proofData, uint64 proofBlockHeight) public {
+    function unlockToken(bytes calldata proofData, uint64 proofBlockHeight) external {
         require(prover.proveOutcome(proofData, proofBlockHeight), "Proof should be valid");
 
         // Unpack the proof and extract the execution outcome.
@@ -70,10 +69,10 @@ contract ERC721TokenLocker {
         ProofDecoder.ExecutionStatus memory status = fullOutcomeProof.outcome_proof.outcome_with_id.outcome.status;
         require(!status.failed, "Cannot use failed execution outcome for unlocking the tokens.");
         require(!status.unknown, "Cannot use unknown execution outcome for unlocking the tokens.");
-        
+
         BurnResult memory result = _decodeBurnResult(status.successValue);
-        ethToken.safeTransferFrom(address(this), result.recipient, result.tokenId);
-        
+        ethToken.transferFrom(address(this), result.recipient, result.tokenId);
+
         emit Unlocked(result.tokenId, result.recipient);
     }
 

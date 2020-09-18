@@ -45,12 +45,12 @@ contract ERC20TokenLocker {
         result.recipient = address(uint160(recipient));
     }
 
-    function lockToken(uint256 amount, string memory accountId) public {
+    function lockToken(uint256 amount, string calldata accountId) external {
         ethToken_.safeTransferFrom(msg.sender, address(this), amount);
         emit Locked(address(ethToken_), msg.sender, amount, accountId);
     }
 
-    function unlockToken(bytes memory proofData, uint64 proofBlockHeight) public {
+    function unlockToken(bytes calldata proofData, uint64 proofBlockHeight) external {
         require(prover_.proveOutcome(proofData, proofBlockHeight), "Proof should be valid");
 
         // Unpack the proof and extract the execution outcome.
